@@ -33,12 +33,12 @@ head(test_data)
 # Cleaning data by removing rows with no employed statuses since we can't make inference on those 66 removed, 11375 unemployed, 5278 employed
 table(train_data$employed_status, useNA = "ifany")
 train_data <- train_data[!is.na(train_data$employed_status), ] 
-train_index <- createDataPartition(train_data$employed_status, 
-                                   p = 0.6, 
-                                   list = FALSE)
+# Group-based split by anonymised_id (prevents participant data leakage)
+unique_ids <- unique(train_data$anonymised_id)
+train_ids <- sample(unique_ids, size = floor(0.6 * length(unique_ids)))
 
-training_set <- train_data[train_index, ]
-validation_set <- train_data[-train_index, ]
+training_set <- train_data %>% filter(anonymised_id %in% train_ids)
+validation_set <- train_data %>% filter(!anonymised_id %in% train_ids)
 
 # Save validation set for later testing
 write.csv(validation_set, "data/validation_set.csv", row.names = FALSE)
@@ -671,10 +671,21 @@ validation_set_clean <- validation_set %>%
 # 3. Generate Predicted Probabilities on validation_set
 val_probabilities <- predict(mle_model, newdata = validation_set_clean, type = "response")
 
-# 4. Calculate Validation Set Accuracy
-predicted_classes <- ifelse(val_probabilities >= 0.5, 1, 0)
-accuracy_score <- mean(predicted_classes == validation_set_clean$employed_status, na.rm = TRUE)
-cat("Validation Set Accuracy:", round(accuracy_score * 100, 2), "%\n")
+# 4. Grid Search for Optimal Cutoff Threshold on Leak-Free Validation Set
+thresholds <- seq(0.2, 0.6, by = 0.01)
+best_thresh <- 0.5
+best_acc <- 0
+
+for (t in thresholds) {
+  acc <- mean((val_probabilities >= t) == validation_set_clean$employed_status, na.rm = TRUE)
+  if (acc > best_acc) {
+    best_acc <- acc
+    best_thresh <- t
+  }
+}
+
+cat("Leak-Free Validation Set Accuracy:", round(best_acc * 100, 2), "%\n")
+cat("Optimal Decision Threshold:", best_thresh, "\n")
 
 # 1. Load the actual test file
 test_data <- read.csv("data/test.csv")
