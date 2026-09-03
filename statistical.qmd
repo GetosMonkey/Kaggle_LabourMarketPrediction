@@ -1,0 +1,718 @@
+---
+title: "Labour Market Status Prediction"
+format: html
+---
+# Kaggle Labour market prediction
+
+## Initial Setup and dependency loading
+
+```{r, echo=FALSE}
+# Initial setup, dependency loading, and data preparation, as well as splitting the data into a training and validation set so that I don't have to use up submissions
+
+library(httpgd)
+library(dplyr)
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(ROCR)
+
+# Setting the seed so that we have reproducible results
+set.seed(2026)
+
+# Visualization of the data
+train_data <- read.csv("data/train.csv")
+test_data <- read.csv("data/test.csv")
+
+head(train_data)
+head(test_data)
+
+# Split training data into training and validation sets (60/40 split)
+# Cleaning data by removing rows with no employed statuses since we can't make inference on those 66 removed, 11375 unemployed, 5278 employed
+table(train_data$employed_status, useNA = "ifany")
+train_data <- train_data[!is.na(train_data$employed_status), ] 
+train_index <- createDataPartition(train_data$employed_status, 
+                                   p = 0.6, 
+                                   list = FALSE)
+
+training_set <- train_data[train_index, ]
+validation_set <- train_data[-train_index, ]
+
+# Save validation set for later testing
+write.csv(validation_set, "data/validation_set.csv", row.names = FALSE)
+
+cat("Training set size:", nrow(training_set), "\n")
+cat("Validation set size:", nrow(validation_set), "\n")
+cat("Employment rate in training:", mean(training_set$employed_status), "\n")
+cat("Employment rate in validation:", mean(validation_set$employed_status), "\n")
+```
+
+## Exploratory data analysis
+
+```{r}
+# 1. DATA OVERVIEW
+cat("========== DATA OVERVIEW ==========\n")
+cat("Training set dimensions:", dim(training_set), "\n")
+cat("Column names:\n")
+print(names(training_set))
+
+# 2. MISSING DATA PATTERNS
+cat("\n========== MISSING DATA ANALYSIS ==========\n")
+
+# Overall missing data
+missing_summary <- data.frame(
+  Column = names(training_set),
+  Missing_Count = colSums(is.na(training_set)),
+  Missing_Percent = round(colSums(is.na(training_set)) / nrow(training_set) * 100, 2)
+) %>% 
+  filter(Missing_Count > 0) %>%
+  arrange(desc(Missing_Percent))
+
+print(missing_summary)
+
+# Visualize missing data patterns
+library(visdat)
+vis_miss(training_set) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# 3. TARGET VARIABLE ANALYSIS
+cat("\n========== TARGET VARIABLE: employed_status ==========\n")
+
+# Distribution
+employment_dist <- table(training_set$employed_status, useNA = "ifany")
+print(employment_dist)
+
+# Percentage
+employment_pct <- prop.table(employment_dist) * 100
+print(employment_pct)
+
+# Visualize
+p1 <- ggplot(training_set, aes(x = factor(employed_status))) +
+  geom_bar(fill = c("red", "green")) +
+  geom_text(stat = "count", aes(label = paste0(round(..count../nrow(training_set)*100, 1), "%")), 
+            vjust = -0.5, size = 5) +
+  labs(title = "Employment Status Distribution",
+       x = "Employed (1) vs Unemployed (0)",
+       y = "Count") +
+  theme_minimal()
+
+print(p1)
+
+# 4. DEMOGRAPHIC FEATURES
+cat("\n========== DEMOGRAPHIC FEATURES ==========\n")
+
+# Age
+if("age" %in% names(training_set)) {
+  cat("\n--- Age Distribution ---\n")
+  age_stats <- summary(training_set$age)
+  print(age_stats)
+  
+  # Age by employment
+  p_age <- ggplot(training_set, aes(x = age, fill = factor(employed_status))) +
+    geom_density(alpha = 0.6) +
+    labs(title = "Age Distribution by Employment Status",
+         x = "Age", y = "Density",
+         fill = "Employed") +
+    theme_minimal()
+  print(p_age)
+  
+  # Age boxplot by employment
+  p_age_box <- ggplot(training_set, aes(x = factor(employed_status), y = age, fill = factor(employed_status))) +
+    geom_boxplot() +
+    labs(title = "Age Distribution by Employment Status",
+         x = "Employed", y = "Age") +
+    theme_minimal()
+  print(p_age_box)
+  
+  # Statistical test
+  age_ttest <- t.test(age ~ employed_status, data = training_set)
+  cat("\nAge t-test p-value:", age_ttest$p.value, "\n")
+}
+
+# Gender
+if("gender" %in% names(training_set)) {
+  cat("\n--- Gender Distribution ---\n")
+  gender_dist <- table(training_set$gender, useNA = "ifany")
+  print(gender_dist)
+  
+  # Gender by employment
+  gender_emp <- table(training_set$gender, training_set$employed_status, useNA = "ifany")
+  print(gender_emp)
+  
+  # Chi-square test
+  if(ncol(gender_emp) == 2 && nrow(gender_emp) >= 2) {
+    chi_gender <- chisq.test(gender_emp)
+    cat("Chi-square p-value:", chi_gender$p.value, "\n")
+  }
+  
+  # Visualize
+  p_gender <- ggplot(training_set, aes(x = gender, fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Employment by Gender",
+         x = "Gender", y = "Proportion",
+         fill = "Employed") +
+    theme_minimal()
+  print(p_gender)
+}
+
+# Race
+if("race" %in% names(training_set)) {
+  cat("\n--- Race Distribution ---\n")
+  race_dist <- table(training_set$race, useNA = "ifany")
+  print(race_dist)
+  
+  # Race by employment
+  race_emp <- table(training_set$race, training_set$employed_status, useNA = "ifany")
+  print(race_emp)
+  
+  # Visualize
+  p_race <- ggplot(training_set, aes(x = race, fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Employment by Race",
+         x = "Race", y = "Proportion",
+         fill = "Employed") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p_race)
+}
+
+# Province
+if("province" %in% names(training_set)) {
+  cat("\n--- Province Distribution ---\n")
+  prov_dist <- table(training_set$province, useNA = "ifany")
+  print(prov_dist)
+  
+  # Province by employment
+  prov_emp <- table(training_set$province, training_set$employed_status, useNA = "ifany")
+  
+  # Visualize
+  p_prov <- ggplot(training_set, aes(x = province, fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Employment by Province",
+         x = "Province", y = "Proportion",
+         fill = "Employed") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p_prov)
+}
+
+# 5. EDUCATION FEATURES
+cat("\n========== EDUCATION FEATURES ==========\n")
+
+# Education Level
+if("education_level" %in% names(training_set)) {
+  cat("\n--- Education Level Distribution ---\n")
+  edu_dist <- table(training_set$education_level, useNA = "ifany")
+  print(edu_dist)
+  
+  # Education by employment
+  edu_emp <- table(training_set$education_level, training_set$employed_status, useNA = "ifany")
+  
+  # Visualize
+  p_edu <- ggplot(training_set, aes(x = education_level, fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Employment by Education Level",
+         x = "Education Level", y = "Proportion",
+         fill = "Employed") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p_edu)
+}
+
+# Grade 12 Equivalent
+if("education_schooling_grade_twelve_equiv" %in% names(training_set)) {
+  cat("\n--- Grade 12 Equivalent ---\n")
+  g12_dist <- table(training_set$education_schooling_grade_twelve_equiv, useNA = "ifany")
+  print(g12_dist)
+  
+  # Visualize
+  p_g12 <- ggplot(training_set, aes(x = education_schooling_grade_twelve_equiv, 
+                                   fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Employment by Grade 12 Equivalent",
+         x = "Grade 12 Equivalent", y = "Proportion",
+         fill = "Employed") +
+    theme_minimal()
+  print(p_g12)
+}
+
+# School Quintile
+if("school_quintile" %in% names(training_set)) {
+  cat("\n--- School Quintile Distribution ---\n")
+  quintile_dist <- table(training_set$school_quintile, useNA = "ifany")
+  print(quintile_dist)
+  
+  # School quintile by employment
+  p_quintile <- ggplot(training_set, aes(x = factor(school_quintile), 
+                                        fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Employment by School Quintile",
+         x = "School Quintile (1=Least Resourced, 5=Most)", 
+         y = "Proportion",
+         fill = "Employed") +
+    theme_minimal()
+  print(p_quintile)
+}
+
+# 6. LABOUR MARKET HISTORY FEATURES
+cat("\n========== LABOUR MARKET HISTORY ==========\n")
+
+# Total historical rounds
+if("total_historical_rounds" %in% names(training_set)) {
+  cat("\n--- Total Historical Rounds ---\n")
+  rounds_summary <- summary(training_set$total_historical_rounds)
+  print(rounds_summary)
+  
+  # Distribution
+  p_rounds <- ggplot(training_set, aes(x = total_historical_rounds, 
+                                      fill = factor(employed_status))) +
+    geom_density(alpha = 0.6) +
+    labs(title = "Historical Rounds by Employment Status",
+         x = "Total Historical Rounds", y = "Density",
+         fill = "Employed") +
+    theme_minimal()
+  print(p_rounds)
+}
+
+# Days since last observation
+if("days_since_last_obs" %in% names(training_set)) {
+  cat("\n--- Days Since Last Observation ---\n")
+  days_summary <- summary(training_set$days_since_last_obs)
+  print(days_summary)
+  
+  # Log transform to handle skew
+  p_days <- ggplot(training_set, aes(x = log1p(days_since_last_obs), 
+                                    fill = factor(employed_status))) +
+    geom_density(alpha = 0.6) +
+    labs(title = "Days Since Last Observation (log) by Employment Status",
+         x = "Log(Days + 1)", y = "Density",
+         fill = "Employed") +
+    theme_minimal()
+  print(p_days)
+}
+
+# Employment lag
+if("employed_lag" %in% names(training_set)) {
+  cat("\n--- Employment Lag ---\n")
+  lag_dist <- table(training_set$employed_lag, useNA = "ifany")
+  print(lag_dist)
+  
+  # Employment lag by current employment
+  lag_emp <- table(training_set$employed_lag, training_set$employed_status, useNA = "ifany")
+  print(lag_emp)
+  
+  # Visualize - consistency of employment
+  p_lag <- ggplot(training_set, aes(x = employed_lag, fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Current Employment by Previous Employment",
+         x = "Employed in Previous Round", y = "Proportion",
+         fill = "Current Employed") +
+    theme_minimal()
+  print(p_lag)
+}
+
+# Status lag detailed
+if("status_lag" %in% names(training_set)) {
+  cat("\n--- Detailed Status Lag ---\n")
+  status_dist <- table(training_set$status_lag, useNA = "ifany")
+  print(status_dist)
+  
+  # Visualize
+  p_status <- ggplot(training_set, aes(x = status_lag, fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Current Employment by Previous Status",
+         x = "Previous Status", y = "Proportion",
+         fill = "Current Employed") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p_status)
+}
+
+# 7. MATRIC PERFORMANCE
+cat("\n========== MATRIC PERFORMANCE ==========\n")
+
+# Function to analyze matric subjects
+analyze_matric <- function(data, subject_col) {
+  if(subject_col %in% names(data)) {
+    cat(paste0("\n--- ", subject_col, " ---\n"))
+    dist <- table(data[[subject_col]], useNA = "ifany")
+    print(dist)
+    
+    # Convert to numeric for analysis
+    get_band_score <- function(x) {
+      if(is.na(x)) return(NA)
+      if(x == "0 - 9 %") return(5)
+      if(x == "10 - 19 %") return(15)
+      if(x == "20 - 29 %") return(25)
+      if(x == "30 - 39 %") return(35)
+      if(x == "40 - 49 %") return(45)
+      if(x == "50 - 59 %") return(55)
+      if(x == "60 - 69 %") return(65)
+      if(x == "70 - 79 %") return(75)
+      if(x == "80 - 89 %") return(85)
+      if(x == "90 - 100 %") return(95)
+      return(NA)
+    }
+    
+    data[[paste0(subject_col, "_numeric")]] <- sapply(data[[subject_col]], get_band_score)
+    
+    # Boxplot by employment
+    p_matric <- ggplot(data, aes(x = factor(employed_status), 
+                                y = .data[[paste0(subject_col, "_numeric")]], 
+                                fill = factor(employed_status))) +
+      geom_boxplot() +
+      labs(title = paste(subject_col, "by Employment Status"),
+           x = "Employed", y = "Score") +
+      theme_minimal()
+    print(p_matric)
+  }
+}
+
+matric_subjects <- c("matric_englishhome", "matric_englishadd", "matric_mathpure", 
+                     "matric_physicalscience", "matric_mathlit")
+
+for(subject in matric_subjects) {
+  analyze_matric(training_set, subject)
+}
+
+# 8. WORK READINESS SCORE
+if("work_readiness_score" %in% names(training_set)) {
+  cat("\n========== WORK READINESS SCORE ==========\n")
+  wr_summary <- summary(training_set$work_readiness_score)
+  print(wr_summary)
+  
+  # Distribution by employment
+  p_wr <- ggplot(training_set, aes(x = work_readiness_score, 
+                                  fill = factor(employed_status))) +
+    geom_density(alpha = 0.6) +
+    labs(title = "Work Readiness Score by Employment Status",
+         x = "Work Readiness Score (0-1)", y = "Density",
+         fill = "Employed") +
+    theme_minimal()
+  print(p_wr)
+  
+  # Boxplot
+  p_wr_box <- ggplot(training_set, aes(x = factor(employed_status), 
+                                      y = work_readiness_score, 
+                                      fill = factor(employed_status))) +
+    geom_boxplot() +
+    labs(title = "Work Readiness Score by Employment Status",
+         x = "Employed", y = "Work Readiness Score") +
+    theme_minimal()
+  print(p_wr_box)
+}
+
+# 9. CORRELATION ANALYSIS
+cat("\n========== CORRELATION ANALYSIS ==========\n")
+
+# Select numeric columns (excluding IDs)
+numeric_cols <- training_set %>%
+  select(where(is.numeric)) %>%
+  select(-starts_with("anonymised_id"))
+
+# Correlation matrix
+cor_matrix <- cor(numeric_cols, use = "pairwise.complete.obs")
+
+# Find top correlations with target
+target_cor <- data.frame(
+  Variable = rownames(cor_matrix),
+  Correlation = cor_matrix[, "employed_status"]
+) %>%
+  filter(Variable != "employed_status") %>%
+  arrange(desc(abs(Correlation)))
+
+cat("\nTop 15 variables correlated with employment status:\n")
+print(head(target_cor, 15))
+
+# Correlation matrix visualization
+library(corrplot)
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, 
+         title = "Correlation Matrix", mar = c(0,0,2,0))
+
+# 10. MULTICOLLINEARITY CHECK
+cat("\n========== MULTICOLLINEARITY CHECK ==========\n")
+
+# Check for highly correlated variables
+high_cor <- which(abs(cor_matrix) > 0.7 & abs(cor_matrix) < 1, arr.ind = TRUE)
+if(length(high_cor) > 0) {
+  high_cor_pairs <- data.frame(
+    Var1 = rownames(cor_matrix)[high_cor[,1]],
+    Var2 = colnames(cor_matrix)[high_cor[,2]],
+    Correlation = cor_matrix[high_cor]
+  ) %>%
+    filter(Var1 != Var2) %>%
+    distinct()
+  
+  cat("\nHighly correlated variable pairs (|r| > 0.7):\n")
+  print(high_cor_pairs)
+}
+
+# 11. INTERACTION ANALYSIS
+cat("\n========== INTERACTION EFFECTS ==========\n")
+
+# Check interaction between key variables
+if("age" %in% names(training_set) && "education_level" %in% names(training_set)) {
+  # Age:Education interaction
+  p_interact <- ggplot(training_set, aes(x = age, fill = factor(employed_status))) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~education_level, scales = "free_y") +
+    labs(title = "Age-Employment Relationship by Education Level",
+         x = "Age", y = "Density",
+         fill = "Employed") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p_interact)
+}
+
+# 12. SUMMARY STATISTICS BY EMPLOYMENT STATUS
+cat("\n========== SUMMARY STATISTICS BY EMPLOYMENT STATUS ==========\n")
+
+# Function to compare numeric variables
+compare_by_employment <- function(data, var_name) {
+  if(var_name %in% names(data) && is.numeric(data[[var_name]])) {
+    stats <- data %>%
+      group_by(employed_status) %>%
+      summarise(
+        Mean = mean(.data[[var_name]], na.rm = TRUE),
+        Median = median(.data[[var_name]], na.rm = TRUE),
+        SD = sd(.data[[var_name]], na.rm = TRUE),
+        Min = min(.data[[var_name]], na.rm = TRUE),
+        Max = max(.data[[var_name]], na.rm = TRUE),
+        N = sum(!is.na(.data[[var_name]]))
+      )
+    
+    cat(paste0("\n--- ", var_name, " ---\n"))
+    print(stats)
+  }
+}
+
+key_vars <- c("age", "total_historical_rounds", "days_since_last_obs", 
+              "tenure_lag", "work_readiness_score")
+
+for(var in key_vars) {
+  compare_by_employment(training_set, var)
+}
+
+# 13. SAMPLE COHORT ANALYSIS
+if("sample" %in% names(training_set)) {
+  cat("\n========== SAMPLE COHORT ANALYSIS ==========\n")
+  
+  sample_emp <- training_set %>%
+    group_by(sample) %>%
+    summarise(
+      Count = n(),
+      Employment_Rate = mean(employed_status, na.rm = TRUE),
+      N_Employed = sum(employed_status == 1, na.rm = TRUE),
+      N_Unemployed = sum(employed_status == 0, na.rm = TRUE)
+    ) %>%
+    arrange(desc(Employment_Rate))
+  
+  print(sample_emp)
+  
+  # Visualize
+  p_sample <- ggplot(training_set, aes(x = sample, fill = factor(employed_status))) +
+    geom_bar(position = "fill") +
+    labs(title = "Employment Rate by Sample Cohort",
+         x = "Sample Cohort", y = "Proportion",
+         fill = "Employed") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p_sample)
+}
+
+# 14. SAVE EDA REPORT
+cat("\n========== SAVING EDA RESULTS ==========\n")
+
+# Save key results for reference
+eda_results <- list(
+  missing_data = missing_summary,
+  target_distribution = employment_dist,
+  age_stats = if("age" %in% names(training_set)) summary(training_set$age) else NULL,
+  correlations = target_cor,
+  sample_employment = if("sample" %in% names(training_set)) sample_emp else NULL
+)
+
+saveRDS(eda_results, "eda_results.rds")
+cat("EDA results saved to 'eda_results.rds'\n")
+
+cat("\n========== EDA COMPLETE ==========\n")
+
+```
+
+# Bootstrapping
+
+```{r}
+
+library(dplyr)
+library(boot)
+
+# 1. Clean Data & Merge Sparse Race Levels
+training_set_clean <- training_set %>%
+  mutate(
+    # Merge Unspecified into Other to eliminate instability/high bias
+    race = ifelse(race %in% c("Unspecified", "Other") | is.na(race), "Other", as.character(race)),
+    age_under_21 = ifelse(!is.na(age) & age < 21, 1, 0),
+    age_prime = ifelse(!is.na(age) & age >= 25 & age <= 29, 1, 0),
+    is_wc_gauteng = ifelse(!is.na(province) & province %in% c("Western Cape", "Gauteng"), 1, 0),
+    quintile_top = ifelse(!is.na(school_quintile) & school_quintile == 5, 1, 0),
+    quintile_bottom = ifelse(!is.na(school_quintile) & school_quintile == 1, 1, 0),
+    has_matric = ifelse(education_schooling_grade_twelve_equiv %in% c(1, "TRUE", TRUE), 1, 0),
+    sample_group = case_when(
+      grepl("Round 3", sample) ~ "Round_3",
+      grepl("Round 4", sample) ~ "Round_4",
+      grepl("Round5|Round 5", sample) ~ "Round_5",
+      grepl("Round6|Round 6", sample) ~ "Round_6",
+      grepl("Round7|Round 7", sample) ~ "Round_7",
+      grepl("Round8|Round 8", sample) ~ "Round_8",
+      TRUE ~ "Baseline_Other"
+    ),
+    work_readiness_score = ifelse(is.na(work_readiness_score), median(work_readiness_score, na.rm = TRUE), work_readiness_score),
+    days_since_last_obs = ifelse(is.na(days_since_last_obs), median(days_since_last_obs, na.rm = TRUE), days_since_last_obs),
+    total_historical_rounds = ifelse(is.na(total_historical_rounds), 0, total_historical_rounds),
+    employed_lag = ifelse(is.na(employed_lag), 0, employed_lag)
+  )
+
+# 2. Refit Model with Cleaned Parameters
+mle_model <- glm(
+  employed_status ~ age_under_21 + age_prime + gender + race + 
+    is_wc_gauteng + has_matric + quintile_top + quintile_bottom + 
+    employed_lag + days_since_last_obs + total_historical_rounds + 
+    work_readiness_score + sample_group,
+  family = binomial(link = "logit"),
+  data = training_set_clean
+)
+
+# Extract aligned coefficient vector names
+master_coef_names <- names(coef(mle_model))
+
+# 3. Robust Bootstrap Simulation
+get_coefficients_safe <- function(data, indices) {
+  d <- data[indices, ]
+  
+  fit <- tryCatch(
+    glm(
+      employed_status ~ age_under_21 + age_prime + gender + race + 
+        is_wc_gauteng + has_matric + quintile_top + quintile_bottom + 
+        employed_lag + days_since_last_obs + total_historical_rounds + 
+        work_readiness_score + sample_group,
+      family = binomial(link = "logit"),
+      data = d
+    ),
+    error = function(e) NULL
+  )
+  
+  res <- setNames(rep(NA, length(master_coef_names)), master_coef_names)
+  if (!is.null(fit)) {
+    cf <- coef(fit)
+    res[names(cf)] <- cf
+  }
+  return(res)
+}
+
+set.seed(123)
+boot_sim <- boot(data = training_set_clean, statistic = get_coefficients_safe, R = 500)
+print(boot_sim)
+
+```
+
+
+# Bootstrap Findings
+
+```{r}
+# Bind variable names directly to bootstrap estimates, bias, and std errors
+boot_summary <- data.frame(
+  Term = names(coef(mle_model)),
+  Original_Beta = boot_sim$t0,
+  Bias = colMeans(boot_sim$t, na.rm = TRUE) - boot_sim$t0,
+  Std_Error = apply(boot_sim$t, 2, sd, na.rm = TRUE)
+)
+
+print(boot_summary)
+
+```
+
+# Writing to submission csv and comparison to VALIDATION set
+
+```{r}
+library(dplyr)
+
+# 1. Store training set medians to prevent data leakage
+train_med_work_readiness <- median(training_set$work_readiness_score, na.rm = TRUE)
+train_med_days_since <- median(training_set$days_since_last_obs, na.rm = TRUE)
+
+# 2. Preprocess validation_set strictly using training parameters
+validation_set_clean <- validation_set %>%
+  mutate(
+    race = ifelse(race %in% c("Unspecified", "Other") | is.na(race), "Other", as.character(race)),
+    age_under_21 = ifelse(!is.na(age) & age < 21, 1, 0),
+    age_prime = ifelse(!is.na(age) & age >= 25 & age <= 29, 1, 0),
+    is_wc_gauteng = ifelse(!is.na(province) & province %in% c("Western Cape", "Gauteng"), 1, 0),
+    quintile_top = ifelse(!is.na(school_quintile) & school_quintile == 5, 1, 0),
+    quintile_bottom = ifelse(!is.na(school_quintile) & school_quintile == 1, 1, 0),
+    has_matric = ifelse(education_schooling_grade_twelve_equiv %in% c(1, "TRUE", TRUE), 1, 0),
+    sample_group = case_when(
+      grepl("Round 3", sample) ~ "Round_3",
+      grepl("Round 4", sample) ~ "Round_4",
+      grepl("Round5|Round 5", sample) ~ "Round_5",
+      grepl("Round6|Round 6", sample) ~ "Round_6",
+      grepl("Round7|Round 7", sample) ~ "Round_7",
+      grepl("Round8|Round 8", sample) ~ "Round_8",
+      TRUE ~ "Baseline_Other"
+    ),
+    work_readiness_score = ifelse(is.na(work_readiness_score), train_med_work_readiness, work_readiness_score),
+    days_since_last_obs = ifelse(is.na(days_since_last_obs), train_med_days_since, days_since_last_obs),
+    total_historical_rounds = ifelse(is.na(total_historical_rounds), 0, total_historical_rounds),
+    employed_lag = ifelse(is.na(employed_lag), 0, employed_lag)
+  )
+
+# 3. Generate Predicted Probabilities on validation_set
+val_probabilities <- predict(mle_model, newdata = validation_set_clean, type = "response")
+
+# 4. Calculate Validation Set Accuracy
+predicted_classes <- ifelse(val_probabilities >= 0.5, 1, 0)
+accuracy_score <- mean(predicted_classes == validation_set_clean$employed_status, na.rm = TRUE)
+cat("Validation Set Accuracy:", round(accuracy_score * 100, 2), "%\n")
+
+# 1. Load the actual test file
+test_data <- read.csv("data/test.csv")
+
+# 2. Change input source from validation_set to test_data
+test_data_clean <- test_data %>%
+  mutate(
+    race = ifelse(race %in% c("Unspecified", "Other") | is.na(race), "Other", as.character(race)),
+    age_under_21 = ifelse(!is.na(age) & age < 21, 1, 0),
+    age_prime = ifelse(!is.na(age) & age >= 25 & age <= 29, 1, 0),
+    is_wc_gauteng = ifelse(!is.na(province) & province %in% c("Western Cape", "Gauteng"), 1, 0),
+    quintile_top = ifelse(!is.na(school_quintile) & school_quintile == 5, 1, 0),
+    quintile_bottom = ifelse(!is.na(school_quintile) & school_quintile == 1, 1, 0),
+    has_matric = ifelse(education_schooling_grade_twelve_equiv %in% c(1, "TRUE", TRUE), 1, 0),
+    sample_group = case_when(
+      grepl("Round 3", sample) ~ "Round_3",
+      grepl("Round 4", sample) ~ "Round_4",
+      grepl("Round5|Round 5", sample) ~ "Round_5",
+      grepl("Round6|Round 6", sample) ~ "Round_6",
+      grepl("Round7|Round 7", sample) ~ "Round_7",
+      grepl("Round8|Round 8", sample) ~ "Round_8",
+      TRUE ~ "Baseline_Other"
+    ),
+    work_readiness_score = ifelse(is.na(work_readiness_score), train_med_work_readiness, work_readiness_score),
+    days_since_last_obs = ifelse(is.na(days_since_last_obs), train_med_days_since, days_since_last_obs),
+    total_historical_rounds = ifelse(is.na(total_historical_rounds), 0, total_historical_rounds),
+    employed_lag = ifelse(is.na(employed_lag), 0, employed_lag)
+  )
+
+# 3. Predict on test_data_clean instead of validation_set_clean
+test_probabilities <- predict(mle_model, newdata = test_data_clean, type = "response")
+
+# 4. Extract IDs directly from test_data_clean
+submission <- data.frame(
+  anonymised_id = test_data_clean$anonymised_id,
+  employed_status = test_probabilities
+)
+
+write.csv(submission, "submission.csv", row.names = FALSE)
+
+```
