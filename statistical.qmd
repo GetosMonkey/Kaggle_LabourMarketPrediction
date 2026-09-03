@@ -542,188 +542,157 @@ cat("\n========== EDA COMPLETE ==========\n")
 
 ```
 
-# Bootstrapping
+#_________________________________________________________________________________________________________
+
+# Penalized Logistic Regression
 
 ```{r}
 
+library(glmnet)
 library(dplyr)
-library(boot)
+library(pROC)
 
-# 1. Clean Data & Merge Sparse Race Levels
-training_set_clean <- training_set %>%
-  mutate(
-    # Merge Unspecified into Other to eliminate instability/high bias
-    race = ifelse(race %in% c("Unspecified", "Other") | is.na(race), "Other", as.character(race)),
-    age_under_21 = ifelse(!is.na(age) & age < 21, 1, 0),
-    age_prime = ifelse(!is.na(age) & age >= 25 & age <= 29, 1, 0),
-    is_wc_gauteng = ifelse(!is.na(province) & province %in% c("Western Cape", "Gauteng"), 1, 0),
-    quintile_top = ifelse(!is.na(school_quintile) & school_quintile == 5, 1, 0),
-    quintile_bottom = ifelse(!is.na(school_quintile) & school_quintile == 1, 1, 0),
-    has_matric = ifelse(education_schooling_grade_twelve_equiv %in% c(1, "TRUE", TRUE), 1, 0),
-    sample_group = case_when(
-      grepl("Round 3", sample) ~ "Round_3",
-      grepl("Round 4", sample) ~ "Round_4",
-      grepl("Round5|Round 5", sample) ~ "Round_5",
-      grepl("Round6|Round 6", sample) ~ "Round_6",
-      grepl("Round7|Round 7", sample) ~ "Round_7",
-      grepl("Round8|Round 8", sample) ~ "Round_8",
-      TRUE ~ "Baseline_Other"
-    ),
-    work_readiness_score = ifelse(is.na(work_readiness_score), median(work_readiness_score, na.rm = TRUE), work_readiness_score),
-    days_since_last_obs = ifelse(is.na(days_since_last_obs), median(days_since_last_obs, na.rm = TRUE), days_since_last_obs),
-    total_historical_rounds = ifelse(is.na(total_historical_rounds), 0, total_historical_rounds),
-    employed_lag = ifelse(is.na(employed_lag), 0, employed_lag)
-  )
+# 1. Clean Training Data & Compute Medians (Leak-Free Baseline)
+train_med_work_readiness <- median(training_set$work_readiness_score, na.rm = TRUE)
+train_med_days_since <- median(training_set$days_since_last_obs, na.rm = TRUE)
 
-# 2. Refit Model with Cleaned Parameters
-mle_model <- glm(
-  employed_status ~ age_under_21 + age_prime + gender + race + 
-    is_wc_gauteng + has_matric + quintile_top + quintile_bottom + 
-    employed_lag + days_since_last_obs + total_historical_rounds + 
-    work_readiness_score + sample_group,
-  family = binomial(link = "logit"),
-  data = training_set_clean
-)
-
-# Extract aligned coefficient vector names
-master_coef_names <- names(coef(mle_model))
-
-# 3. Robust Bootstrap Simulation
-get_coefficients_safe <- function(data, indices) {
-  d <- data[indices, ]
-  
-  fit <- tryCatch(
-    glm(
-      employed_status ~ age_under_21 + age_prime + gender + race + 
-        is_wc_gauteng + has_matric + quintile_top + quintile_bottom + 
-        employed_lag + days_since_last_obs + total_historical_rounds + 
-        work_readiness_score + sample_group,
-      family = binomial(link = "logit"),
-      data = d
-    ),
-    error = function(e) NULL
-  )
-  
-  res <- setNames(rep(NA, length(master_coef_names)), master_coef_names)
-  if (!is.null(fit)) {
-    cf <- coef(fit)
-    res[names(cf)] <- cf
-  }
-  return(res)
+clean_pipeline <- function(data) {
+  data %>%
+    mutate(
+      race = factor(ifelse(race %in% c("Unspecified", "Other") | is.na(race), "Other", as.character(race))),
+      gender = factor(ifelse(is.na(gender), "Unknown", as.character(gender))),
+      age_under_21 = ifelse(!is.na(age) & age < 21, 1, 0),
+      age_prime = ifelse(!is.na(age) & age >= 25 & age <= 29, 1, 0),
+      is_wc_gauteng = ifelse(!is.na(province) & province %in% c("Western Cape", "Gauteng"), 1, 0),
+      quintile_top = ifelse(!is.na(school_quintile) & school_quintile == 5, 1, 0),
+      quintile_bottom = ifelse(!is.na(school_quintile) & school_quintile == 1, 1, 0),
+      has_matric = ifelse(education_schooling_grade_twelve_equiv %in% c(1, "TRUE", TRUE), 1, 0),
+      sample_group = factor(case_when(
+        grepl("Round 3", sample) ~ "Round_3",
+        grepl("Round 4", sample) ~ "Round_4",
+        grepl("Round5|Round 5", sample) ~ "Round_5",
+        grepl("Round6|Round 6", sample) ~ "Round_6",
+        grepl("Round7|Round 7", sample) ~ "Round_7",
+        grepl("Round8|Round 8", sample) ~ "Round_8",
+        TRUE ~ "Baseline_Other"
+      )),
+      work_readiness_score = ifelse(is.na(work_readiness_score), train_med_work_readiness, work_readiness_score),
+      days_since_last_obs = ifelse(is.na(days_since_last_obs), train_med_days_since, days_since_last_obs),
+      total_historical_rounds = ifelse(is.na(total_historical_rounds), 0, total_historical_rounds),
+      employed_lag = ifelse(is.na(employed_lag), 0, employed_lag)
+    )
 }
 
-set.seed(123)
-boot_sim <- boot(data = training_set_clean, statistic = get_coefficients_safe, R = 500)
-print(boot_sim)
+training_set_clean <- clean_pipeline(training_set)
+validation_set_clean <- clean_pipeline(validation_set)
 
-```
+# 2. Build Unified Model Formula & Create Sparse Design Matrices
+feature_formula <- ~ age_under_21 + age_prime + gender + race + 
+  is_wc_gauteng + has_matric + quintile_top + quintile_bottom + 
+  employed_lag + days_since_last_obs + total_historical_rounds + 
+  work_readiness_score + sample_group - 1
 
+X_train <- model.matrix(feature_formula, data = training_set_clean)
+y_train <- training_set_clean$employed_status
 
-# Bootstrap Findings
+X_val <- model.matrix(feature_formula, data = validation_set_clean)
+y_val <- validation_set_clean$employed_status
 
-```{r}
-# Bind variable names directly to bootstrap estimates, bias, and std errors
-boot_summary <- data.frame(
-  Term = names(coef(mle_model)),
-  Original_Beta = boot_sim$t0,
-  Bias = colMeans(boot_sim$t, na.rm = TRUE) - boot_sim$t0,
-  Std_Error = apply(boot_sim$t, 2, sd, na.rm = TRUE)
-)
+# 3. Tuning Alpha (Mixing Parameter) via 10-Fold Cross-Validation
+alpha_grid <- c(0.0, 0.25, 0.5, 0.75, 1.0)
+best_cv_auc <- 0
+best_alpha <- 0.5
+elastic_net_models <- list()
 
-print(boot_summary)
+set.seed(2026)
+for (a in alpha_grid) {
+  cv_fit <- cv.glmnet(
+    x = X_train, 
+    y = y_train, 
+    family = "binomial", 
+    alpha = a, 
+    type.measure = "auc", 
+    nfolds = 10
+  )
+  elastic_net_models[[as.character(a)]] <- cv_fit
+  max_auc <- max(cv_fit$cvm)
+  
+  if (max_auc > best_cv_auc) {
+    best_cv_auc <- max_auc
+    best_alpha <- a
+  }
+}
+
+best_cv_model <- elastic_net_models[[as.character(best_alpha)]]
+cat("Optimal Alpha:", best_alpha, "(0 = Ridge, 0.5 = Elastic Net, 1 = Lasso)\n")
+cat("Optimal Lambda (1SE Regularization):", best_cv_model$lambda.1se, "\n")
+cat("10-Fold CV AUC:", round(best_cv_auc, 4), "\n")
+
+# 4. Inspect Non-Zero Coefficients Selected by Penalization
+selected_coefs <- coef(best_cv_model, s = "lambda.1se")
+coef_df <- data.frame(
+  Feature = rownames(selected_coefs),
+  Coefficient = as.vector(selected_coefs)
+) %>% filter(Coefficient != 0)
+
+print(coef_df)
 
 ```
 
 # Writing to submission csv and comparison to VALIDATION set
 
 ```{r}
-library(dplyr)
 
-# 1. Store training set medians to prevent data leakage
-train_med_work_readiness <- median(training_set$work_readiness_score, na.rm = TRUE)
-train_med_days_since <- median(training_set$days_since_last_obs, na.rm = TRUE)
+# 1. Predict Probabilities on Validation Set using lambda.1se (prevents overfitting)
+val_probabilities <- predict(best_cv_model, newx = X_val, s = "lambda.1se", type = "response")[, 1]
 
-# 2. Preprocess validation_set strictly using training parameters
-validation_set_clean <- validation_set %>%
-  mutate(
-    race = ifelse(race %in% c("Unspecified", "Other") | is.na(race), "Other", as.character(race)),
-    age_under_21 = ifelse(!is.na(age) & age < 21, 1, 0),
-    age_prime = ifelse(!is.na(age) & age >= 25 & age <= 29, 1, 0),
-    is_wc_gauteng = ifelse(!is.na(province) & province %in% c("Western Cape", "Gauteng"), 1, 0),
-    quintile_top = ifelse(!is.na(school_quintile) & school_quintile == 5, 1, 0),
-    quintile_bottom = ifelse(!is.na(school_quintile) & school_quintile == 1, 1, 0),
-    has_matric = ifelse(education_schooling_grade_twelve_equiv %in% c(1, "TRUE", TRUE), 1, 0),
-    sample_group = case_when(
-      grepl("Round 3", sample) ~ "Round_3",
-      grepl("Round 4", sample) ~ "Round_4",
-      grepl("Round5|Round 5", sample) ~ "Round_5",
-      grepl("Round6|Round 6", sample) ~ "Round_6",
-      grepl("Round7|Round 7", sample) ~ "Round_7",
-      grepl("Round8|Round 8", sample) ~ "Round_8",
-      TRUE ~ "Baseline_Other"
-    ),
-    work_readiness_score = ifelse(is.na(work_readiness_score), train_med_work_readiness, work_readiness_score),
-    days_since_last_obs = ifelse(is.na(days_since_last_obs), train_med_days_since, days_since_last_obs),
-    total_historical_rounds = ifelse(is.na(total_historical_rounds), 0, total_historical_rounds),
-    employed_lag = ifelse(is.na(employed_lag), 0, employed_lag)
-  )
+# 2. Evaluate ROC-AUC on Leak-Free Validation Set
+val_roc <- roc(y_val, val_probabilities, quiet = TRUE)
+cat("Elastic Net Validation AUC:", round(auc(val_roc), 4), "\n")
 
-# 3. Generate Predicted Probabilities on validation_set
-val_probabilities <- predict(mle_model, newdata = validation_set_clean, type = "response")
-
-# 4. Grid Search for Optimal Cutoff Threshold on Leak-Free Validation Set
+# 3. Decision Threshold Search for Classification Metrics
 thresholds <- seq(0.2, 0.6, by = 0.01)
 best_thresh <- 0.5
 best_acc <- 0
 
 for (t in thresholds) {
-  acc <- mean((val_probabilities >= t) == validation_set_clean$employed_status, na.rm = TRUE)
+  acc <- mean((val_probabilities >= t) == y_val, na.rm = TRUE)
   if (acc > best_acc) {
     best_acc <- acc
     best_thresh <- t
   }
 }
 
-cat("Leak-Free Validation Set Accuracy:", round(best_acc * 100, 2), "%\n")
-cat("Optimal Decision Threshold:", best_thresh, "\n")
+cat("Validation Accuracy:", round(best_acc * 100, 2), "%\n")
+cat("Optimal Threshold:", best_thresh, "\n")
 
-# 1. Load the actual test file
+```
+
+```{r}
+# 1. Preprocess Kaggle Test Set
 test_data <- read.csv("data/test.csv")
+test_data_clean <- clean_pipeline(test_data)
 
-# 2. Change input source from validation_set to test_data
-test_data_clean <- test_data %>%
+# 2. Align factor levels with training set to prevent single-level contrast errors
+test_data_clean <- test_data_clean %>%
   mutate(
-    race = ifelse(race %in% c("Unspecified", "Other") | is.na(race), "Other", as.character(race)),
-    age_under_21 = ifelse(!is.na(age) & age < 21, 1, 0),
-    age_prime = ifelse(!is.na(age) & age >= 25 & age <= 29, 1, 0),
-    is_wc_gauteng = ifelse(!is.na(province) & province %in% c("Western Cape", "Gauteng"), 1, 0),
-    quintile_top = ifelse(!is.na(school_quintile) & school_quintile == 5, 1, 0),
-    quintile_bottom = ifelse(!is.na(school_quintile) & school_quintile == 1, 1, 0),
-    has_matric = ifelse(education_schooling_grade_twelve_equiv %in% c(1, "TRUE", TRUE), 1, 0),
-    sample_group = case_when(
-      grepl("Round 3", sample) ~ "Round_3",
-      grepl("Round 4", sample) ~ "Round_4",
-      grepl("Round5|Round 5", sample) ~ "Round_5",
-      grepl("Round6|Round 6", sample) ~ "Round_6",
-      grepl("Round7|Round 7", sample) ~ "Round_7",
-      grepl("Round8|Round 8", sample) ~ "Round_8",
-      TRUE ~ "Baseline_Other"
-    ),
-    work_readiness_score = ifelse(is.na(work_readiness_score), train_med_work_readiness, work_readiness_score),
-    days_since_last_obs = ifelse(is.na(days_since_last_obs), train_med_days_since, days_since_last_obs),
-    total_historical_rounds = ifelse(is.na(total_historical_rounds), 0, total_historical_rounds),
-    employed_lag = ifelse(is.na(employed_lag), 0, employed_lag)
+    race = factor(race, levels = levels(training_set_clean$race)),
+    gender = factor(gender, levels = levels(training_set_clean$gender)),
+    sample_group = factor(sample_group, levels = levels(training_set_clean$sample_group))
   )
 
-# 3. Predict on test_data_clean instead of validation_set_clean
-test_probabilities <- predict(mle_model, newdata = test_data_clean, type = "response")
+# 3. Build Test Feature Matrix (Now safely aligned with Training Dummy Variables)
+X_test <- model.matrix(feature_formula, data = test_data_clean)
 
-# 4. Extract IDs directly from test_data_clean
+# 4. Generate Predictions using Elastic Net
+test_probabilities <- predict(best_cv_model, newx = X_test, s = "lambda.1se", type = "response")[, 1]
+
+# 5. Write Submission File
 submission <- data.frame(
   anonymised_id = test_data_clean$anonymised_id,
   employed_status = test_probabilities
 )
 
 write.csv(submission, "submission.csv", row.names = FALSE)
-
+cat("Successfully generated submission.csv with Elastic Net model.\n")
 ```
