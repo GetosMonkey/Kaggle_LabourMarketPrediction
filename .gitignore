@@ -1,0 +1,135 @@
+# =========================
+
+# Project outputs / data
+
+# =========================
+
+# Final generated outputs
+
+output.csv
+test.csv
+train.csv
+
+# Data files
+
+*.csv
+*.parquet
+*.feather
+
+# If you have CSVs that should be tracked, remove the *.csv line above
+
+# and keep only the specific files you want ignored.
+
+# =========================
+
+# Python
+
+# =========================
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+
+build/
+dist/
+*.egg-info/
+
+# Python tooling
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+
+# R
+
+# =========================
+
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio
+
+.Rproj.user/
+
+# R package build files
+
+*.tar.gz
+
+# R Markdown / knitr caches
+
+*_cache/
+cache/
+figure/
+
+# =========================
+
+# Quarto
+
+# =========================
+
+# Quarto rendered output
+
+.quarto/
+
+# Quarto execution/cache files
+
+*_files/
+*_cache/
+
+# =========================
+
+# Jupyter
+
+# =========================
+
+.ipynb_checkpoints/
+
+# =========================
+
+# IDEs / Editors
+
+# =========================
+
+.vscode/
+.idea/
+
+# =========================
+
+# OS files
+
+# =========================
+
+# macOS
+
+.DS_Store
+
+# Windows
+
+Thumbs.db
+Desktop.ini
+
+# =========================
+
+# Environment / secrets
+
+# =========================
+
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
