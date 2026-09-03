@@ -1,0 +1,19 @@
+---
+title: "Labour Market Status Prediction"
+format: html
+---
+
+```{r}
+# Runs in R
+library(httpgd)
+library(dplyr)
+train_data <- read.csv("data/train.csv")
+head(train_data)
+```
+
+```{python}
+# Runs in Python
+import pandas as pd
+df = r.train_data.copy()
+print(df.info())
+```
